@@ -22,3 +22,5 @@ tests/
 AGENTS.md
 CLAUDE.md
 .kiro/
+# ONNX models (downloaded from HuggingFace, ~1.4GB)
+arkose/models/

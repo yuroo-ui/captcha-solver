@@ -9,7 +9,7 @@ for the browser-based paths.
 creation and form recon (CSRF/honeypot scraping, filling account fields) are the
 **caller's** job, not this service.
 
-Supported types (10): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
+Supported types (11): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
 Enterprise), **hCaptcha** (checkbox / invisible / real-page), **Cloudflare**
 (`cf_clearance`), **AWS WAF** (`aws-waf-token`, silent JS challenge), **BotGuard**
 (Google OAuth `bgRequest` token), **DataDome** (`datadome` clearance cookie —
@@ -18,7 +18,10 @@ gate), **PerimeterX** (HUMAN "Press & Hold" → `_px3` cookie via a real CDP pre
 gesture that drives the SHA-256 hashcash PoW Worker + biomechanics), **Akamai**
 (Bot Manager `_abck` clearance cookie via the `bmak` telemetry sensor), **Aliyun**
 (Captcha 2.0 slide-puzzle → `{certifyId, deviceToken, data}` token via cv2 gap
-detection + a quadratic handle→piece drag; params `scene_id` + `prefix`, no sitekey).
+detection + a quadratic handle→piece drag; params `scene_id` + `prefix`, no sitekey),
+**Arkose** (FunCaptcha visual puzzle → `fc_token` via ONNX image classification;
+CloakBrowser intercepts `gfct` challenge, predicts answer per wave, encrypts with
+CryptoJS AES-CBC format, multi-wave pipeline up to 10 rounds).
 
 ## Architecture
 
@@ -34,7 +37,8 @@ client ──HTTP──> server.py (FastAPI, :8877)
                      ├── datadome/solve.py       (CloakBrowser — datadome cookie; caller passes url+referer)
                      ├── perimeterx/solve.py     (CloakBrowser — _px3 via CDP press-hold; renderers/ trigger the gate)
                      ├── akamai/solve.py         (CloakBrowser — _abck via bmak telemetry sensor)
-                     └── aliyun/solve.py         (CloakBrowser — slide-puzzle; cv2 gap detect + quadratic drag)
+                     ├── aliyun/solve.py         (CloakBrowser — slide-puzzle; cv2 gap detect + quadratic drag)
+                     └── arkose/solve.py         (CloakBrowser + ONNX — FunCaptcha visual puzzle; gfct intercept → predict → AES encrypt → multi-wave /fc/ca/)
 ```
 
 Each sub-solver launches CloakBrowser via `cloakbrowser.launch_async()`,
@@ -45,7 +49,7 @@ drives/harvests the challenge, and returns a replayable token. Every solver is
 
 | Method | Path       | Auth        | Description                                  |
 | ------ | ---------- | ----------- | -------------------------------------------- |
-| GET    | `/health`  | public      | Liveness + supported types (10)              |
+| GET    | `/health`  | public      | Liveness + supported types (11)              |
 | GET    | `/status`  | token       | Service status + list of currently running tasks |
 | GET    | `/logs`    | token       | Last N solve events (buffer holds up to 100; `lines` caps at 200 but returns only what's buffered; `total` is the full buffer size) |
 | POST   | `/solve`   | token       | Solve a captcha (dispatch by `type`)         |
@@ -177,7 +181,13 @@ when you deliberately need to hit an internal target.
   // aliyun only (no sitekey, no url)
   "scene_id": "1r7eif79x",            // target site's captcha SceneId          (required)
   "prefix": "13lbkb5",                // captcha-open endpoint prefix           (required)
-  "region": "sgp"                     // sgp (default) | cn | intl
+  "region": "sgp",                    // sgp (default) | cn | intl
+
+  // arkose only
+  "public_key": "A0DE7B75-...",       // Arkose site public key                 (required)
+  "page_url": "https://login.site.com", // page that triggers Arkose           (required)
+  "surl": "https://client-api.arkoselabs.com",  // service URL override        (optional)
+  "max_waves": 10                     // max challenge waves before giving up   (optional, default 10)
 }
 ```
 
@@ -237,6 +247,11 @@ curl -X POST http://127.0.0.1:8877/solve \
 curl -X POST http://127.0.0.1:8877/solve \
   -H "Content-Type: application/json" \
   -d '{"type":"awswaf","url":"https://protected.example.com","proxy":"http://user:pass@ip:port"}'
+
+# Arkose FunCaptcha (visual puzzle — pass public_key + page_url)
+curl -X POST http://127.0.0.1:8877/solve \
+  -H "Content-Type: application/json" \
+  -d '{"type":"arkose","public_key":"A0DE7B75-1138-44F2-B132-ED188CEB66F3","page_url":"https://login.databricks.com/login","max_waves":10}'
 ```
 
 ## Remote access (public domain)
@@ -425,6 +440,31 @@ curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
 - The gate is **intermittent** (silent-pass on some sessions) — no gate → the solver
   honestly reports `solved:false` / `gate_reached:false`, never a fake success.
 
+## Arkose FunCaptcha (visual puzzle → `fc_token`)
+
+`POST /solve` with `type: "arkose"` solves Arkose Labs FunCaptcha visual puzzles.
+CloakBrowser navigates the caller-supplied `page_url`, triggers the Arkose widget
+using the site's `public_key`, intercepts the `gfct` challenge response, predicts
+the answer via ONNX image classification, encrypts it in CryptoJS AES-CBC format,
+and submits to `/fc/ca/` — repeating across multiple waves until solved.
+
+```bash
+curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
+  -d '{"type":"arkose",
+       "public_key":"A0DE7B75-1138-44F2-B132-ED188CEB66F3",
+       "page_url":"https://login.databricks.com/login",
+       "max_waves":10}'
+```
+
+- `public_key` (**required**): Arkose site public key (e.g. Databricks `A0DE7B75-...`,
+  Roblox `476068BF-...`).
+- `page_url` (**required**): page that triggers the Arkose widget.
+- `surl` (optional): Arkose service URL override (auto-detected from gfct domain).
+- `max_waves` (optional, default 10): max challenge rounds before giving up.
+- 24 pre-trained ONNX models cover common variants (conveyor, penguins, coordinates,
+  dice, shadows, etc.). Unknown variants return `solved:false` with an error.
+- See `arkose/README.md` for full protocol details, model list, and encryption format.
+
 ## Files
 
 ```
@@ -455,11 +495,20 @@ captcha-solver/
 │   ├── solve.py
 │   ├── _selfcheck.py
 │   └── README.md
-└── perimeterx/            # HUMAN "Press & Hold" → _px3 (CDP press-hold + PoW)
-    ├── solve.py           #   site-agnostic core: detect gate → press-hold → harvest
-    ├── renderers/         #   per-site gate triggers (render_flow param)
-    │   ├── __init__.py    #     RENDERERS registry
-    │   └── outlook.py     #     outlook_signup: throwaway form nav to surface the gate
+├── perimeterx/            # HUMAN "Press & Hold" → _px3 (CDP press-hold + PoW)
+│   ├── solve.py           #   site-agnostic core: detect gate → press-hold → harvest
+│   ├── renderers/         #   per-site gate triggers (render_flow param)
+│   │   ├── __init__.py    #     RENDERERS registry
+│   │   └── outlook.py     #     outlook_signup: throwaway form nav to surface the gate
+│   └── README.md
+├── akamai/                # Bot Manager _abck clearance
+│   └── solve.py
+├── aliyun/                # Captcha 2.0 slide-puzzle
+│   └── solve.py
+└── arkose/                # FunCaptcha visual puzzle (ONNX classification)
+    ├── solve.py           #   CloakBrowser → gfct intercept → predict → encrypt → /fc/ca/
+    ├── predict.py         #   ONNX predictor (4 threads, ~0.1s inference)
+    ├── models/            #   24 pre-trained ONNX models (~1.4GB)
     └── README.md
 ```
 

@@ -69,12 +69,12 @@ app = FastAPI(
 # the endpoint proceeds — real enforcement stays at the Caddy layer (public domain only).
 _bearer = HTTPBearer(auto_error=False, description="Bearer token (required on the public "
                      "domain; enforced by the reverse proxy). Ignored for local calls.")
-SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun"]
+SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun", "arkose"]
 # Page-level solvers that harvest a cookie/token from the live page (no sitekey needed).
 _PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai")
 # Solvers that supply their own canonical URL (caller need not pass `url`).
 # datadome is NOT here: the caller passes the DataDome-fronted url (+ referer) itself.
-_SELF_URL = ("botguard", "perimeterx", "aliyun")
+_SELF_URL = ("botguard", "perimeterx", "aliyun", "arkose")
 # Allow private/loopback targets only when explicitly opted in (dev/testing).
 _ALLOW_PRIVATE = os.getenv("SOLVER_ALLOW_PRIVATE") == "1"
 
@@ -231,6 +231,10 @@ class SolveRequest(BaseModel):
     prefix: Optional[str] = Field(None, description="aliyun: the captcha-open endpoint prefix (e.g. '13lbkb5' -> <prefix>.captcha-open-southeast.aliyuncs.com). Required for type=aliyun.")
     region: Optional[str] = Field(None, description="aliyun: captcha region — 'sgp' (default), 'cn', or 'intl'.")
 
+    # arkose-only (Arkose FunCaptcha)
+    public_key: Optional[str] = Field(None, description="arkose: Arkose public key from the target site's embed. Required for type=arkose.")
+    game_type: Optional[str] = Field("4", description="arkose: Arkose game type (default '4').")
+
 
 # Named request examples → Swagger UI renders these as a dropdown picker on /solve.
 _SOLVE_EXAMPLES = {
@@ -292,6 +296,10 @@ _SOLVE_EXAMPLES = {
         "summary": "PerimeterX/HUMAN 'Press & Hold' → harvest _px3 clearance cookie (render_flow trigger)",
         "value": {"type": "perimeterx", "render_flow": "outlook_signup",
                   "proxy": "http://user:pass@ip:port"},
+    },
+    "arkose": {
+        "summary": "Arkose FunCaptcha (ONNX image prediction)",
+        "value": {"type": "arkose", "public_key": "0x0000000000000000000000000000000"},
     },
 }
 
@@ -464,6 +472,15 @@ async def _dispatch(req: SolveRequest) -> dict:
                 break
         return {"type": "aliyun", **r}
 
+    if req.type == "arkose":
+        from arkose.solve import solve_arkose
+        actions, _ = _extract(req)
+        r = await solve_arkose(
+            public_key=req.public_key or "", page_url=req.url,
+            game_type=req.game_type or "4", proxy=req.proxy,
+            timeout_s=req.timeout_s or 120, pre_actions=actions)
+        return {"type": "arkose", **r}
+
     # reCAPTCHA
     from recaptcha.solve import (
         solve_recaptcha_v3, solve_recaptcha_v3_realpage, solve_recaptcha_invisible,
@@ -543,7 +560,9 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
         raise HTTPException(400, "url is required")
     if req.type == "aliyun" and (not req.scene_id or not req.prefix):
         raise HTTPException(400, "scene_id and prefix are required for type=aliyun")
-    if req.type not in _PAGE_LEVEL and req.type != "aliyun" and not req.sitekey:
+    if req.type == "arkose" and not req.public_key:
+        raise HTTPException(400, "public_key is required for type=arkose")
+    if req.type not in _PAGE_LEVEL and req.type not in ("aliyun", "arkose") and not req.sitekey:
         raise HTTPException(400, f"sitekey is required for type={req.type}")
     _validate_urls(req)
 
